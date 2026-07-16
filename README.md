@@ -1,6 +1,6 @@
-# Clause: Claude Code usage guard
+# Clause
 
-Clause wraps Claude Code with automatic usage-limit protection, verified post-reset resumption, a token-efficient runtime profile, and an independent fail-closed supervisor.
+Clause is a fail-closed foreground wrapper for Claude Code. It limits token-amplifying behavior, stops work at configured account-usage thresholds, verifies fresh below-threshold telemetry before launch or automatic resume, and preserves the exact guarded session.
 
 ## Install
 
@@ -8,87 +8,87 @@ Clause wraps Claude Code with automatic usage-limit protection, verified post-re
 ./install-claude-guard-auto-resume.sh
 ```
 
-After testing, the installer recommends:
+The installer creates:
+
+```text
+~/.local/bin/clause
+~/.local/libexec/clause/clause-core
+~/.local/libexec/clause/clause-statusline.sh
+~/.local/libexec/clause/clause-tool-gate.sh
+```
+
+It removes the old `claude-guard`, `claude-guard-core`, and `claude-guard-statusline.sh` executables. Update the shell alias after installation:
 
 ```bash
-alias claude='claude-guard'
+alias claude='clause'
 ```
 
-## Run
+## Usage
 
 ```bash
-CLAUDE_GUARD_5H_STOP=90 CLAUDE_GUARD_7D_STOP=90 claude-guard
+clause
+clause --resume
+clause --continue
 ```
 
-At a configured threshold, Clause stops the active Claude Code process and waits until every blocking reset timestamp has passed. It then makes one non-persistent Haiku request to verify that Anthropic is actually accepting requests again. Only after that probe succeeds does it resume the exact persisted session.
-
-A failed or timed-out reset probe does not resume the saved session. Clause retries with exponential backoff, starting at 30 seconds and capping at five minutes.
-
-## Fail-closed supervision
-
-The installed `claude-guard` command is an independent supervisor. The pause/probe/resume implementation is installed separately as `claude-guard-core`.
-
-The supervisor terminates the guarded process tree and does **not** auto-resume when any of these occur:
-
-- Status-line telemetry is missing or becomes stale.
-- Rate-limit percentages never become available.
-- Usage reaches a configured threshold but the core does not stop Claude promptly.
-- The core crashes or exits while its Claude child remains alive.
-- The supervisor itself receives a termination signal while guarded work is active.
-
-Default supervisor tolerances:
+Default thresholds are 90% for both the five-hour and seven-day windows. They can be lowered but not raised above 90:
 
 ```bash
-CLAUDE_GUARD_TELEMETRY_STARTUP_GRACE_SECONDS=60
-CLAUDE_GUARD_TELEMETRY_STALE_SECONDS=30
-CLAUDE_GUARD_USAGE_DATA_GRACE_SECONDS=180
-CLAUDE_GUARD_BLOCK_HANDLING_GRACE_SECONDS=15
+CLAUSE_5H_STOP=85 CLAUSE_7D_STOP=85 clause
 ```
 
-Set `CLAUDE_GUARD_AUTO_RESUME=0` to retain the hard stop without automatic waiting or resumption.
-
-Optional reset-probe controls:
+Disable automatic resume while retaining fail-closed stopping:
 
 ```bash
-CLAUDE_GUARD_RESET_PROBE_MODEL=haiku
-CLAUDE_GUARD_RESET_PROBE_INITIAL_SECONDS=30
-CLAUDE_GUARD_RESET_PROBE_MAX_SECONDS=300
-CLAUDE_GUARD_RESET_PROBE_TIMEOUT_SECONDS=90
+CLAUSE_AUTO_RESUME=0 clause
 ```
 
-## Token-efficient runtime profile
+Only one Clause session may run at a time. A second invocation fails rather than allowing concurrent sessions to cross the account threshold together.
 
-Clause enables this session-only profile by default without modifying `~/.claude/settings.json`:
+## Runtime profile
 
-```json
-{
-  "model": "sonnet",
-  "effortLevel": "medium",
-  "autoCompactEnabled": true,
-  "workflowSizeGuideline": "small",
-  "verbose": false,
-  "permissions": {
-    "deny": [
-      "Agent(general-purpose)"
-    ]
-  }
-}
-```
+New sessions receive Sonnet with medium effort, automatic compaction, small workflow guidance, and non-verbose output. Resumed sessions retain the session's existing main model and effort.
 
-It also overrides the `Explore` subagent for the session with a narrowly scoped, read-only Haiku agent using low effort and only `Read`, `Grep`, and `Glob`.
+Clause overrides `Explore` with a read-only Haiku definition limited to `Read`, `Grep`, and `Glob`, capped at eight turns. Background task functionality and experimental agent teams are disabled for every guarded launch. General-purpose and Plan subagents, Opus subagents, isolated subagents, dynamic workflows, monitors, scheduled prompts, remote triggers, background shell tasks, PowerShell, and inter-agent messaging are denied.
 
-Existing file-based settings remain loaded. Clause does not replace the installed status line, hooks, MCP configuration, or unrelated permission rules. For a resumed session, Clause omits model and effort defaults so an in-session `/model` or `/effort` selection survives.
-
-Disable only the optimization profile:
+Disable only the optional model/compaction defaults:
 
 ```bash
-claude-guard --guard-no-profile
+CLAUSE_OPTIMIZATION_PROFILE=0 clause
 ```
 
-Explicitly bypass both safety layers:
+Fail-closed supervision, foreground-only execution, the mandatory status line and hooks, background-task disabling, and bounded Haiku subagent controls remain active.
+
+## Verified reset and fail-closed behavior
+
+Clause requires both rate-limit windows to be present and below threshold before starting or resuming work. It launches a tool-disabled, non-persistent Haiku probe and waits for the status-line collector to publish fresh account telemetry. A successful text response alone is not accepted as reset proof.
+
+Clause terminates the active Claude process and does not resume it when:
+
+- guarded-session telemetry is missing, malformed, or stale;
+- either rate-limit window is missing;
+- a configured threshold is crossed and the core does not stop Claude promptly;
+- the core or supervisor exits while Claude remains active;
+- the supervisor heartbeat is lost;
+- a reset probe times out or cannot produce fresh below-threshold telemetry;
+- the mandatory SessionStart or PreToolUse hook layer is unavailable;
+- an internal process-state record is malformed;
+- a concurrent Clause invocation is attempted.
+
+The mandatory PreToolUse gate also blocks background agents, background Bash calls, shell detachment operators and common daemon/scheduler commands, nested Claude launches, dynamic workflows, monitors, recurring prompts, remote triggers, PowerShell, and agent-team messaging.
+
+The core is installed outside `PATH`, mode `0700`, and refuses execution unless its parent supervisor and per-run nonce match. The status-line collector independently kills the advertised Claude PID if the supervisor heartbeat disappears.
+
+Print mode, background sessions, cloud/remote sessions, safe mode, permission-bypass flags, replacement settings/agent flags, and daemon-managed sessions are refused because they cannot retain Clause's required supervision invariants.
+
+## Explicit bypass
+
+Raw Claude is available only through an explicit flag:
 
 ```bash
-claude --guard-bypass
+clause --clause-bypass <claude arguments>
 ```
 
-The dynamic-workflow size setting requires Claude Code 2.1.202 or newer.
+No environment-variable bypass exists. The old `claude-guard` executable is removed and no compatibility symlink is installed.
+
+No userspace wrapper can protect against deliberate use of the raw `claude` binary, explicit `--clause-bypass`, deliberate replacement of the installed scripts, simultaneous usage from another machine or client, kernel failure, power loss, or deliberate `SIGKILL` of every enforcement process before any one of them can stop Claude. For normal `clause` execution, the identified software paths stop rather than continue.
