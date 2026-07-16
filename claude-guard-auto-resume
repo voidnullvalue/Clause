@@ -1,501 +1,198 @@
 #!/usr/bin/env bash
-# Claude Code usage guard with automatic pause/wait/resume.
-#
-# Interactive-session behavior:
-#   1. Watches Claude Code's structured statusLine rate-limit telemetry.
-#   2. Stops the current Claude process when a configured threshold is reached.
-#   3. Waits until every blocking rate-limit window has reset.
-#   4. Confirms the reset with one cheap Haiku request before resuming.
-#   5. Resumes the exact saved Claude session by session_id and asks it to
-#      verify filesystem state before continuing the interrupted task.
-#   6. Applies a token-efficient runtime profile without changing settings.json.
-#
-# Requires: bash, jq, flock, pgrep, date, awk, timeout, grep, claude.
+# Clause core: guarded launch, threshold stop, verified reset, exact resume.
 
 set -uo pipefail
 
-STATE_DIR="${CLAUDE_GUARD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-guard}"
-STATE_FILE="$STATE_DIR/usage.json"
-LOCK_FILE="$STATE_DIR/usage.lock"
-INSTANCES_DIR="$STATE_DIR/instances"
-LOG_FILE="$STATE_DIR/guard.log"
+STATE_DIR="${CLAUSE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/clause}"
+LOG_FILE="$STATE_DIR/clause.log"
+RUN_DIR="${CLAUSE_RUN_DIR:-}"
+RUN_ID="${CLAUSE_RUN_ID:-}"
+AUTH_FILE="${CLAUSE_AUTH_FILE:-}"
+AUTH_TOKEN="${CLAUSE_AUTH_TOKEN:-}"
+SUPERVISOR_PID="${CLAUSE_SUPERVISOR_PID:-0}"
+FIVE_HOUR_STOP="${CLAUSE_5H_STOP:-90}"
+SEVEN_DAY_STOP="${CLAUSE_7D_STOP:-90}"
+AUTO_RESUME="${CLAUSE_AUTO_RESUME:-1}"
+OPTIMIZATION_PROFILE="${CLAUSE_OPTIMIZATION_PROFILE:-1}"
+RESUME_PROMPT="${CLAUSE_RESUME_PROMPT:-Usage limits are safely below the configured thresholds. Continue the original task from the exact current repository and session state. Before changing anything, inspect git status, git diff, any task list, and interrupted command results. Do not repeat completed external side effects.}"
 
-FIVE_HOUR_STOP="${CLAUDE_GUARD_5H_STOP:-95}"
-SEVEN_DAY_STOP="${CLAUDE_GUARD_7D_STOP:-95}"
-POLL_SECONDS="${CLAUDE_GUARD_POLL_SECONDS:-1}"
-INT_GRACE_SECONDS="${CLAUDE_GUARD_INT_GRACE_SECONDS:-3}"
-TERM_GRACE_SECONDS="${CLAUDE_GUARD_TERM_GRACE_SECONDS:-3}"
-RESET_BUFFER_SECONDS="${CLAUDE_GUARD_RESET_BUFFER_SECONDS:-10}"
-WAIT_NOTICE_SECONDS="${CLAUDE_GUARD_WAIT_NOTICE_SECONDS:-300}"
-RESET_PROBE_INITIAL_SECONDS="${CLAUDE_GUARD_RESET_PROBE_INITIAL_SECONDS:-30}"
-RESET_PROBE_MAX_SECONDS="${CLAUDE_GUARD_RESET_PROBE_MAX_SECONDS:-300}"
-RESET_PROBE_TIMEOUT_SECONDS="${CLAUDE_GUARD_RESET_PROBE_TIMEOUT_SECONDS:-90}"
-RESET_PROBE_MODEL="${CLAUDE_GUARD_RESET_PROBE_MODEL:-haiku}"
-RESET_PROBE_TOKEN='CLAUDE_GUARD_RESET_OK'
-AUTO_RESUME="${CLAUDE_GUARD_AUTO_RESUME:-1}"
-OPTIMIZATION_PROFILE="${CLAUDE_GUARD_OPTIMIZATION_PROFILE:-1}"
-AUTO_RESUME_PROMPT="${CLAUDE_GUARD_RESUME_PROMPT:-Usage limits have reset. Continue the original task from the exact current repository and session state. Before changing anything, inspect git status, git diff, any task list, and the results of commands that may have been interrupted. Do not repeat completed external side effects or destructive operations. Verify the result of an interrupted operation before retrying it, then continue until the original task is complete.}"
+POLL_SECONDS=1
+HOOK_GRACE_SECONDS=15
+TELEMETRY_GRACE_SECONDS=60
+TELEMETRY_STALE_SECONDS=30
+PROBE_TIMEOUT_SECONDS=90
+PROBE_RETRY_INITIAL_SECONDS=30
+PROBE_RETRY_MAX_SECONDS=300
+TERM_GRACE_SECONDS=3
 
-RUNTIME_SETTINGS_JSON='{"model":"sonnet","effortLevel":"medium","autoCompactEnabled":true,"workflowSizeGuideline":"small","verbose":false,"permissions":{"deny":["Agent(general-purpose)"]}}'
-RESUME_SETTINGS_JSON='{"autoCompactEnabled":true,"workflowSizeGuideline":"small","verbose":false,"permissions":{"deny":["Agent(general-purpose)"]}}'
-EXPLORE_AGENT_JSON='{"Explore":{"description":"Targeted read-only repository lookup used only when exact files, symbols, or call paths are unknown.","prompt":"Search narrowly and return concise evidence. Prefer exact symbols, strings, and known directory boundaries. Do not broadly survey the repository. Do not inspect generated, dependency, cache, build, or vendor directories unless directly implicated. Do not paste entire files or large command outputs. Return only relevant file paths and line ranges, the discovered call or data flow, and unresolved ambiguity requiring further inspection.","tools":["Read","Grep","Glob"],"model":"haiku","effort":"low"}}'
+SAFETY_SETTINGS_JSON='{"statusLine":{"type":"command","command":"~/.local/libexec/clause/clause-statusline.sh","padding":0,"refreshInterval":1},"env":{"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS":"1","CLAUDE_CODE_FORK_SUBAGENT":"0","CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":"0","CLAUDE_CODE_SUBAGENT_MODEL":"haiku","CLAUDE_CODE_USE_POWERSHELL_TOOL":"0"},"permissions":{"deny":["Agent(general-purpose)","Agent(Plan)","Agent(model:opus)","Agent(isolation:*)","Workflow","Monitor","CronCreate","RemoteTrigger","ScheduleWakeup","SendMessage","PowerShell","Bash(run_in_background:true)"]},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"~/.local/libexec/clause/clause-tool-gate.sh --session-start","timeout":5}]}],"PreToolUse":[{"matcher":"Agent|Bash|PowerShell|Workflow|Monitor|CronCreate|RemoteTrigger|ScheduleWakeup|SendMessage","hooks":[{"type":"command","command":"~/.local/libexec/clause/clause-tool-gate.sh --pre-tool-use","timeout":5}]}]}}'
+RUNTIME_SETTINGS_JSON='{"model":"sonnet","effortLevel":"medium","autoCompactEnabled":true,"workflowSizeGuideline":"small","verbose":false,"statusLine":{"type":"command","command":"~/.local/libexec/clause/clause-statusline.sh","padding":0,"refreshInterval":1},"env":{"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS":"1","CLAUDE_CODE_FORK_SUBAGENT":"0","CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":"0","CLAUDE_CODE_SUBAGENT_MODEL":"haiku","CLAUDE_CODE_USE_POWERSHELL_TOOL":"0"},"permissions":{"deny":["Agent(general-purpose)","Agent(Plan)","Agent(model:opus)","Agent(isolation:*)","Workflow","Monitor","CronCreate","RemoteTrigger","ScheduleWakeup","SendMessage","PowerShell","Bash(run_in_background:true)"]},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"~/.local/libexec/clause/clause-tool-gate.sh --session-start","timeout":5}]}],"PreToolUse":[{"matcher":"Agent|Bash|PowerShell|Workflow|Monitor|CronCreate|RemoteTrigger|ScheduleWakeup|SendMessage","hooks":[{"type":"command","command":"~/.local/libexec/clause/clause-tool-gate.sh --pre-tool-use","timeout":5}]}]}}'
+RESUME_SETTINGS_JSON='{"autoCompactEnabled":true,"workflowSizeGuideline":"small","verbose":false,"statusLine":{"type":"command","command":"~/.local/libexec/clause/clause-statusline.sh","padding":0,"refreshInterval":1},"env":{"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS":"1","CLAUDE_CODE_FORK_SUBAGENT":"0","CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":"0","CLAUDE_CODE_SUBAGENT_MODEL":"haiku","CLAUDE_CODE_USE_POWERSHELL_TOOL":"0"},"permissions":{"deny":["Agent(general-purpose)","Agent(Plan)","Agent(model:opus)","Agent(isolation:*)","Workflow","Monitor","CronCreate","RemoteTrigger","ScheduleWakeup","SendMessage","PowerShell","Bash(run_in_background:true)"]},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"~/.local/libexec/clause/clause-tool-gate.sh --session-start","timeout":5}]}],"PreToolUse":[{"matcher":"Agent|Bash|PowerShell|Workflow|Monitor|CronCreate|RemoteTrigger|ScheduleWakeup|SendMessage","hooks":[{"type":"command","command":"~/.local/libexec/clause/clause-tool-gate.sh --pre-tool-use","timeout":5}]}]}}'
+PROBE_SETTINGS_JSON='{"model":"haiku","effortLevel":"low","verbose":false,"statusLine":{"type":"command","command":"~/.local/libexec/clause/clause-statusline.sh","padding":0,"refreshInterval":1},"env":{"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS":"1","CLAUDE_CODE_FORK_SUBAGENT":"0","CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":"0","CLAUDE_CODE_SUBAGENT_MODEL":"haiku","CLAUDE_CODE_USE_POWERSHELL_TOOL":"0"},"permissions":{"deny":["Agent","Workflow","Monitor","CronCreate","RemoteTrigger","ScheduleWakeup","SendMessage","PowerShell","Bash(run_in_background:true)"]},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"~/.local/libexec/clause/clause-tool-gate.sh --session-start","timeout":5}]}],"PreToolUse":[{"matcher":"Agent|Bash|PowerShell|Workflow|Monitor|CronCreate|RemoteTrigger|ScheduleWakeup|SendMessage","hooks":[{"type":"command","command":"~/.local/libexec/clause/clause-tool-gate.sh --pre-tool-use","timeout":5}]}]}}'
+EXPLORE_AGENT_JSON='{"Explore":{"description":"Targeted read-only repository lookup used only when exact files, symbols, or call paths are unknown.","prompt":"Search narrowly and return concise evidence. Prefer exact symbols, strings, and known directory boundaries. Do not broadly survey the repository. Do not inspect generated, dependency, cache, build, or vendor directories unless directly implicated. Do not paste entire files or large command outputs. Return only relevant file paths and line ranges, the discovered call or data flow, and unresolved ambiguity requiring further inspection.","tools":["Read","Grep","Glob"],"disallowedTools":["Agent","Bash","PowerShell","Workflow","Monitor","CronCreate","RemoteTrigger","ScheduleWakeup","SendMessage","mcp__*"],"model":"haiku","effort":"low","maxTurns":8,"background":false}}'
 
-guard_bypass=0
-forward_args=()
-for arg in "$@"; do
-    case "$arg" in
-        --guard-bypass)
-            guard_bypass=1
-            ;;
-        --guard-no-profile)
-            OPTIMIZATION_PROFILE=0
-            ;;
-        *)
-            forward_args+=("$arg")
-            ;;
-    esac
+for cmd in claude jq flock pgrep date awk mktemp; do
+    command -v "$cmd" >/dev/null 2>&1 || { printf 'clause-core: missing dependency: %s\n' "$cmd" >&2; exit 127; }
 done
-set -- "${forward_args[@]}"
 
-if [[ "$guard_bypass" == "1" ]]; then
-    if ! command -v claude >/dev/null 2>&1; then
-        printf 'claude-guard: claude executable not found.\n' >&2
-        exit 127
-    fi
-    exec claude "$@"
+is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+is_number() { [[ "${1:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]; }
+ge() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'; }
+
+if ! is_uint "$SUPERVISOR_PID" || (( SUPERVISOR_PID <= 1 )) \
+    || [[ "$PPID" != "$SUPERVISOR_PID" || -z "$RUN_DIR" || -z "$RUN_ID" \
+    || -z "$AUTH_FILE" || -z "$AUTH_TOKEN" || ! -s "$AUTH_FILE" ]] \
+    || ! jq -e --argjson pid "$SUPERVISOR_PID" --arg run "$RUN_ID" --arg token "$AUTH_TOKEN" \
+        '.supervisor_pid==$pid and .run_id==$run and .token==$token' "$AUTH_FILE" >/dev/null 2>&1; then
+    printf 'clause-core: denied; run through ~/.local/bin/clause.\n' >&2
+    exit 77
 fi
 
-mkdir -p "$INSTANCES_DIR"
-chmod 700 "$STATE_DIR" "$INSTANCES_DIR" 2>/dev/null || true
+[[ "$AUTO_RESUME" == 0 || "$AUTO_RESUME" == 1 ]] || { printf 'clause-core: CLAUSE_AUTO_RESUME must be 0 or 1.\n' >&2; exit 64; }
+[[ "$OPTIMIZATION_PROFILE" == 0 || "$OPTIMIZATION_PROFILE" == 1 ]] || { printf 'clause-core: CLAUSE_OPTIMIZATION_PROFILE must be 0 or 1.\n' >&2; exit 64; }
 
-for cmd in claude jq flock pgrep date awk timeout grep; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        printf 'claude-guard: required command not found: %s\n' "$cmd" >&2
-        exit 127
+INSTANCE_FILE="$RUN_DIR/instance.json"
+TELEMETRY_FILE="$RUN_DIR/telemetry.json"
+SESSION_FILE="$RUN_DIR/session.json"
+HOOK_MARKER_FILE="$RUN_DIR/hook-marker.json"
+active_pid=''
+generation=0
+watch_pid=''
+
+log() { printf '%s core_pid=%s run_id=%s %s\n' "$(date --iso-8601=seconds)" "$$" "$RUN_ID" "$*" >>"$LOG_FILE"; }
+children_of() { pgrep -P "$1" 2>/dev/null || true; }
+signal_tree() { local sig="$1" pid="$2" child; while read -r child; do [[ -n "$child" ]] && signal_tree "$sig" "$child"; done < <(children_of "$pid"); kill "-$sig" "$pid" 2>/dev/null || true; }
+
+publish_phase() {
+    local phase="$1" pid="${2:-0}" kind="${3:-}" tmp
+    tmp="$(mktemp "$RUN_DIR/.instance.XXXXXX")" || return 1
+    jq -n --arg phase "$phase" --argjson active_pid "$pid" --arg active_kind "$kind" \
+        --argjson generation "$generation" --argjson phase_started_at "$(date +%s)" \
+        '{phase:$phase,active_pid:$active_pid,active_kind:$active_kind,generation:$generation,phase_started_at:$phase_started_at}' >"$tmp" || return 1
+    chmod 600 "$tmp"; mv -f "$tmp" "$INSTANCE_FILE"
+}
+
+stop_active() {
+    [[ -n "$active_pid" ]] || return 0
+    publish_phase stopping "$active_pid" "${1:-process}" || true
+    if kill -0 "$active_pid" 2>/dev/null; then
+        kill -INT "$active_pid" 2>/dev/null || true; sleep "$TERM_GRACE_SECONDS"
     fi
-done
-
-is_number() {
-    [[ "${1:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]
-}
-
-is_uint() {
-    [[ "${1:-}" =~ ^[0-9]+$ ]]
-}
-
-ge() {
-    awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'
-}
-
-format_epoch() {
-    local epoch="$1"
-    date -d "@$epoch" '+%Y-%m-%d %l:%M:%S%P %Z' 2>/dev/null || printf '%s' "$epoch"
-}
-
-log() {
-    printf '%s instance=%s %s\n' "$(date --iso-8601=seconds)" "$instance_id" "$*" >>"$LOG_FILE"
-}
-
-read_block() {
-    local now five_pct five_reset seven_pct seven_reset
-    local reasons=() pcts=() latest_reset=0
-
-    [[ -s "$STATE_FILE" ]] || return 1
-    jq -e . "$STATE_FILE" >/dev/null 2>&1 || return 1
-
-    now="$(date +%s)"
-    five_pct="$(jq -r '.five_hour.used_percentage // empty' "$STATE_FILE")"
-    five_reset="$(jq -r '.five_hour.resets_at // 0' "$STATE_FILE")"
-    seven_pct="$(jq -r '.seven_day.used_percentage // empty' "$STATE_FILE")"
-    seven_reset="$(jq -r '.seven_day.resets_at // 0' "$STATE_FILE")"
-
-    if is_number "$five_pct" && is_uint "$five_reset" \
-        && (( five_reset > now )) && ge "$five_pct" "$FIVE_HOUR_STOP"; then
-        reasons+=("five_hour")
-        pcts+=("$five_pct")
-        (( five_reset > latest_reset )) && latest_reset="$five_reset"
+    if kill -0 "$active_pid" 2>/dev/null; then
+        signal_tree TERM "$active_pid"; sleep "$TERM_GRACE_SECONDS"
     fi
-
-    if is_number "$seven_pct" && is_uint "$seven_reset" \
-        && (( seven_reset > now )) && ge "$seven_pct" "$SEVEN_DAY_STOP"; then
-        reasons+=("seven_day")
-        pcts+=("$seven_pct")
-        (( seven_reset > latest_reset )) && latest_reset="$seven_reset"
-    fi
-
-    ((${#reasons[@]} > 0)) || return 1
-
-    BLOCK_REASON="$(IFS=+; printf '%s' "${reasons[*]}")"
-    BLOCK_PCT="$(IFS=+; printf '%s' "${pcts[*]}")"
-    BLOCK_RESET="$latest_reset"
-    return 0
-}
-
-needs_reset_confirmation() {
-    local now verified five_pct five_reset seven_pct seven_reset
-
-    [[ -s "$STATE_FILE" ]] || return 1
-    jq -e . "$STATE_FILE" >/dev/null 2>&1 || return 1
-
-    now="$(date +%s)"
-    verified="$(jq -r '.reset_confirmation.verified_at // 0' "$STATE_FILE")"
-    five_pct="$(jq -r '.five_hour.used_percentage // empty' "$STATE_FILE")"
-    five_reset="$(jq -r '.five_hour.resets_at // 0' "$STATE_FILE")"
-    seven_pct="$(jq -r '.seven_day.used_percentage // empty' "$STATE_FILE")"
-    seven_reset="$(jq -r '.seven_day.resets_at // 0' "$STATE_FILE")"
-
-    if is_number "$five_pct" && is_uint "$five_reset" \
-        && ge "$five_pct" "$FIVE_HOUR_STOP" \
-        && (( five_reset > 0 && five_reset <= now && verified < five_reset )); then
-        return 0
-    fi
-
-    if is_number "$seven_pct" && is_uint "$seven_reset" \
-        && ge "$seven_pct" "$SEVEN_DAY_STOP" \
-        && (( seven_reset > 0 && seven_reset <= now && verified < seven_reset )); then
-        return 0
-    fi
-
-    return 1
-}
-
-mark_reset_confirmed() {
-    local now tmp
-    now="$(date +%s)"
-
-    exec 7>"$LOCK_FILE"
-    flock -x 7
-    if [[ -s "$STATE_FILE" ]] && jq -e . "$STATE_FILE" >/dev/null 2>&1; then
-        tmp="$(mktemp "$STATE_DIR/.usage.XXXXXX")"
-        jq \
-            --argjson now "$now" \
-            --arg model "$RESET_PROBE_MODEL" \
-            '.reset_confirmation = {verified_at:$now, model:$model}' \
-            "$STATE_FILE" >"$tmp"
-        chmod 600 "$tmp"
-        mv -f "$tmp" "$STATE_FILE"
-    fi
-    flock -u 7
-}
-
-confirm_reset_with_probe() {
-    local delay attempt probe_output probe_exit probe_result
-    delay="$RESET_PROBE_INITIAL_SECONDS"
-    attempt=0
-
-    while true; do
-        attempt=$((attempt + 1))
-        probe_output="$(mktemp "$STATE_DIR/.reset-probe.XXXXXX")"
-        probe_exit=0
-        probe_result='request_failed'
-
-        printf 'claude-guard: confirming reset with a one-turn %s probe (attempt %s).\n' \
-            "$RESET_PROBE_MODEL" "$attempt" >/dev/tty
-        log "action=reset_probe_start attempt=$attempt model=$(printf '%q' "$RESET_PROBE_MODEL")"
-
-        timeout "$RESET_PROBE_TIMEOUT_SECONDS" \
-            claude --print --model "$RESET_PROBE_MODEL" --no-session-persistence \
-            "Reply with exactly $RESET_PROBE_TOKEN and nothing else." \
-            </dev/null >"$probe_output" 2>&1 || probe_exit=$?
-
-        if (( probe_exit == 0 )) && grep -Fq "$RESET_PROBE_TOKEN" "$probe_output"; then
-            rm -f "$probe_output"
-            mark_reset_confirmed
-            log "action=reset_probe_success attempt=$attempt"
-            printf 'claude-guard: reset confirmed; resuming the saved session.\n' >/dev/tty
-            return 0
-        fi
-
-        if (( probe_exit == 124 )); then
-            probe_result='timeout'
-        elif (( probe_exit == 0 )); then
-            probe_result='unexpected_output'
-        fi
-        rm -f "$probe_output"
-
-        log "action=reset_probe_retry attempt=$attempt result=$probe_result exit_code=$probe_exit retry_seconds=$delay"
-        printf 'claude-guard: reset not confirmed (%s, exit %s); retrying in %ss.\n' \
-            "$probe_result" "$probe_exit" "$delay" >/dev/tty
-        sleep "$delay"
-
-        if (( delay < RESET_PROBE_MAX_SECONDS )); then
-            delay=$((delay * 2))
-            (( delay > RESET_PROBE_MAX_SECONDS )) && delay="$RESET_PROBE_MAX_SECONDS"
-        fi
-    done
-}
-
-resume_eligible=1
-initial_session_is_resume=0
-for arg in "$@"; do
-    case "$arg" in
-        -p|--print|--no-session-persistence)
-            resume_eligible=0
-            ;;
-        -c|--continue|-r|--resume)
-            initial_session_is_resume=1
-            ;;
-    esac
-done
-
-first_non_option=''
-for arg in "$@"; do
-    if [[ "$arg" != -* ]]; then
-        first_non_option="$arg"
-        break
-    fi
-done
-case "$first_non_option" in
-    update|install|auth|agents|attach|auto-mode|daemon|doctor|gateway|logs|mcp|plugin|plugins|project|remote-control|respawn|rm|setup-token|stop|kill|ultrareview)
-        resume_eligible=0
-        ;;
-esac
-
-if [[ "$AUTO_RESUME" != "1" && "$AUTO_RESUME" != "0" ]]; then
-    printf 'claude-guard: CLAUDE_GUARD_AUTO_RESUME must be 0 or 1.\n' >&2
-    exit 64
-fi
-
-if [[ "$OPTIMIZATION_PROFILE" != "1" && "$OPTIMIZATION_PROFILE" != "0" ]]; then
-    printf 'claude-guard: CLAUDE_GUARD_OPTIMIZATION_PROFILE must be 0 or 1.\n' >&2
-    exit 64
-fi
-
-for value_name in RESET_PROBE_INITIAL_SECONDS RESET_PROBE_MAX_SECONDS RESET_PROBE_TIMEOUT_SECONDS; do
-    value="${!value_name}"
-    if ! is_uint "$value" || (( value < 1 )); then
-        printf 'claude-guard: %s must be a positive integer.\n' "CLAUDE_GUARD_${value_name}" >&2
-        exit 64
-    fi
-done
-
-if (( RESET_PROBE_INITIAL_SECONDS > RESET_PROBE_MAX_SECONDS )); then
-    printf 'claude-guard: CLAUDE_GUARD_RESET_PROBE_INITIAL_SECONDS must not exceed CLAUDE_GUARD_RESET_PROBE_MAX_SECONDS.\n' >&2
-    exit 64
-fi
-
-instance_id="$$-$(date +%s)-$RANDOM"
-instance_file="$INSTANCES_DIR/$instance_id.json"
-session_file="$INSTANCES_DIR/$instance_id.session.json"
-pause_file="$INSTANCES_DIR/$instance_id.pause.json"
-claude_pid=''
-watchdog_pid=''
-user_aborted=0
-launch_count=0
-
-children_of() {
-    pgrep -P "$1" 2>/dev/null || true
-}
-
-signal_tree() {
-    local signal="$1" pid="$2" child
-    while read -r child; do
-        [[ -n "$child" ]] || continue
-        signal_tree "$signal" "$child"
-    done < <(children_of "$pid")
-    kill "-$signal" "$pid" 2>/dev/null || true
-}
-
-stop_claude() {
-    local why="$1"
-
-    log "action=stop reason=$(printf '%q' "$why") claude_pid=${claude_pid:-none}"
-    printf '\nclaude-guard: pausing Claude Code: %s\n' "$why" >/dev/tty
-
-    if [[ -n "$claude_pid" ]] && kill -0 "$claude_pid" 2>/dev/null; then
-        kill -INT "$claude_pid" 2>/dev/null || true
-        sleep "$INT_GRACE_SECONDS"
-    fi
-
-    if [[ -n "$claude_pid" ]] && kill -0 "$claude_pid" 2>/dev/null; then
-        signal_tree TERM "$claude_pid"
-        sleep "$TERM_GRACE_SECONDS"
-    fi
-
-    if [[ -n "$claude_pid" ]] && kill -0 "$claude_pid" 2>/dev/null; then
-        signal_tree KILL "$claude_pid"
-    fi
-}
-
-write_pause_file() {
-    local reason="$1" pct="$2" reset="$3" tmp
-    tmp="$(mktemp "$INSTANCES_DIR/.pause.XXXXXX")"
-    jq -n \
-        --arg reason "$reason" \
-        --arg pct "$pct" \
-        --argjson reset "$reset" \
-        --argjson observed_at "$(date +%s)" \
-        '{reason:$reason, used_percentage:$pct, resets_at:$reset, observed_at:$observed_at}' \
-        >"$tmp"
-    chmod 600 "$tmp"
-    mv -f "$tmp" "$pause_file"
-}
-
-watch_usage() {
-    trap - EXIT INT TERM HUP
-    while kill -0 "$claude_pid" 2>/dev/null; do
-        if read_block; then
-            write_pause_file "$BLOCK_REASON" "$BLOCK_PCT" "$BLOCK_RESET"
-            reset_display="$(format_epoch "$BLOCK_RESET")"
-            stop_claude "$BLOCK_REASON usage reached ${BLOCK_PCT}% (resets $reset_display)"
-            return 0
-        fi
-        sleep "$POLL_SECONDS"
-    done
-}
-
-get_session_id() {
-    local attempts=0 value
-    while (( attempts < 20 )); do
-        if [[ -s "$session_file" ]] && jq -e . "$session_file" >/dev/null 2>&1; then
-            value="$(jq -r '.session_id // empty' "$session_file")"
-            if [[ -n "$value" && "$value" != "unknown" ]]; then
-                printf '%s' "$value"
-                return 0
-            fi
-        fi
-        sleep 0.25
-        attempts=$((attempts + 1))
-    done
-    return 1
-}
-
-wait_until_reset_timestamp() {
-    local last_notice=0 now remaining sleep_for
-
-    while read_block; do
-        now="$(date +%s)"
-        remaining=$(( BLOCK_RESET - now + RESET_BUFFER_SECONDS ))
-        (( remaining < 1 )) && remaining=1
-
-        if (( last_notice == 0 || now - last_notice >= WAIT_NOTICE_SECONDS || remaining <= 60 )); then
-            printf 'claude-guard: waiting for %s reset; probe after %s (%ss remaining).\n' \
-                "$BLOCK_REASON" "$(format_epoch "$((BLOCK_RESET + RESET_BUFFER_SECONDS))")" "$remaining" >/dev/tty
-            last_notice="$now"
-        fi
-
-        sleep_for="$POLL_SECONDS"
-        (( sleep_for > remaining )) && sleep_for="$remaining"
-        sleep "$sleep_for"
-    done
-
-    sleep "$RESET_BUFFER_SECONDS"
+    kill -0 "$active_pid" 2>/dev/null && signal_tree KILL "$active_pid"
+    active_pid=''; publish_phase idle 0 '' || true
 }
 
 cleanup() {
-    local exit_code=$?
+    local rc=$?
     trap - EXIT INT TERM HUP
-
-    if [[ -n "$watchdog_pid" ]]; then
-        kill "$watchdog_pid" 2>/dev/null || true
-        wait "$watchdog_pid" 2>/dev/null || true
-    fi
-
-    if [[ -n "$claude_pid" ]] && kill -0 "$claude_pid" 2>/dev/null; then
-        stop_claude "wrapper exiting"
-    fi
-
-    rm -f "$instance_file" "$session_file" "$pause_file"
-    exit "$exit_code"
+    [[ -n "$watch_pid" ]] && kill "$watch_pid" 2>/dev/null || true
+    stop_active cleanup
+    exit "$rc"
 }
-
-on_signal() {
-    user_aborted=1
-    stop_claude "wrapper received a user termination signal"
-    exit 130
-}
-
 trap cleanup EXIT
-trap on_signal INT TERM HUP
+trap 'exit 130' INT TERM HUP
 
-log "action=wrapper_start cwd=$(printf '%q' "$PWD") argc=$# auto_resume=$AUTO_RESUME resume_eligible=$resume_eligible optimization_profile=$OPTIMIZATION_PROFILE"
+telemetry_safe() {
+    local file="$1" expected_generation="$2" now updated observed five seven
+    [[ -s "$file" ]] && jq -e . "$file" >/dev/null 2>&1 || return 1
+    now="$(date +%s)"; updated="$(jq -r '.updated_at // 0' "$file")"; observed="$(jq -r '.generation // 0' "$file")"
+    is_uint "$updated" && (( updated > 0 && now - updated <= TELEMETRY_STALE_SECONDS )) || return 1
+    [[ "$observed" == "$expected_generation" ]] || return 1
+    five="$(jq -r '.five_hour.used_percentage // empty' "$file")"; seven="$(jq -r '.seven_day.used_percentage // empty' "$file")"
+    is_number "$five" && is_number "$seven" || return 1
+    ! ge "$five" "$FIVE_HOUR_STOP" && ! ge "$seven" "$SEVEN_DAY_STOP"
+}
 
-if read_block; then
-    if [[ "$AUTO_RESUME" == "1" && "$resume_eligible" == "1" ]]; then
-        printf 'claude-guard: usage is already blocked by %s at %s%%.\n' "$BLOCK_REASON" "$BLOCK_PCT" >/dev/tty
-        wait_until_reset_timestamp
-        confirm_reset_with_probe
-    else
-        printf 'claude-guard: refusing to start: %s usage is %s%%.\n' "$BLOCK_REASON" "$BLOCK_PCT" >&2
-        printf 'claude-guard: allowed again after %s.\n' "$(format_epoch "$BLOCK_RESET")" >&2
-        exit 75
-    fi
-elif needs_reset_confirmation; then
-    printf 'claude-guard: cached usage is still above threshold after its reset timestamp; verifying availability before launch.\n' >/dev/tty
-    confirm_reset_with_probe
-fi
+hook_ready() {
+    [[ -s "$HOOK_MARKER_FILE" ]] && jq -e --arg run "$RUN_ID" --argjson generation "$generation" \
+        '.run_id==$run and .generation==$generation' "$HOOK_MARKER_FILE" >/dev/null 2>&1
+}
 
-resume_session_id=''
+launch_env() {
+    CLAUSE_RUN_ID="$RUN_ID" CLAUSE_RUN_DIR="$RUN_DIR" CLAUSE_GENERATION="$generation" \
+    CLAUSE_HOOK_MARKER_FILE="$HOOK_MARKER_FILE" CLAUSE_5H_STOP="$FIVE_HOUR_STOP" CLAUSE_7D_STOP="$SEVEN_DAY_STOP" \
+    CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 CLAUDE_CODE_FORK_SUBAGENT=0 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0 \
+    CLAUDE_CODE_SUBAGENT_MODEL=haiku CLAUDE_CODE_USE_POWERSHELL_TOOL=0 "$@"
+}
 
+probe_until_safe() {
+    local delay="$PROBE_RETRY_INITIAL_SECONDS" probe_file started
+    while true; do
+        generation=$((generation + 1)); rm -f "$HOOK_MARKER_FILE"
+        probe_file="$RUN_DIR/probe-$generation.json"; rm -f "$probe_file"
+        launch_env env CLAUSE_PROBE_TELEMETRY_FILE="$probe_file" CLAUSE_PROBE_GENERATION="$generation" CLAUSE_ACTIVE_KIND=reset-probe \
+            claude --settings "$PROBE_SETTINGS_JSON" --model haiku --effort low --no-session-persistence \
+            'Reply with exactly CLAUSE_PROBE and wait.' </dev/tty >/dev/tty 2>/dev/tty &
+        active_pid=$!; publish_phase probe "$active_pid" reset-probe || exit 78
+        started="$(date +%s)"
+        while kill -0 "$active_pid" 2>/dev/null; do
+            if hook_ready && telemetry_safe "$probe_file" "$generation"; then
+                stop_active reset-probe; rm -f "$probe_file"; log "action=probe_safe generation=$generation"; return 0
+            fi
+            if (( $(date +%s) - started >= PROBE_TIMEOUT_SECONDS )); then break; fi
+            sleep "$POLL_SECONDS"
+        done
+        stop_active reset-probe; rm -f "$probe_file"
+        log "action=probe_retry delay=$delay"
+        sleep "$delay"; (( delay < PROBE_RETRY_MAX_SECONDS )) && delay=$((delay * 2)); (( delay > PROBE_RETRY_MAX_SECONDS )) && delay="$PROBE_RETRY_MAX_SECONDS"
+    done
+}
+
+watch_work() {
+    local started="$(date +%s)"
+    while kill -0 "$active_pid" 2>/dev/null; do
+        if ! hook_ready && (( $(date +%s) - started >= HOOK_GRACE_SECONDS )); then
+            log 'action=hook_missing'; stop_active work; return 78
+        fi
+        if [[ -s "$TELEMETRY_FILE" ]] && jq -e . "$TELEMETRY_FILE" >/dev/null 2>&1; then
+            five="$(jq -r '.five_hour.used_percentage // empty' "$TELEMETRY_FILE")"; seven="$(jq -r '.seven_day.used_percentage // empty' "$TELEMETRY_FILE")"
+            if is_number "$five" && is_number "$seven" && { ge "$five" "$FIVE_HOUR_STOP" || ge "$seven" "$SEVEN_DAY_STOP"; }; then
+                log "action=threshold five=$five seven=$seven"; stop_active work; return 75
+            fi
+        elif (( $(date +%s) - started >= TELEMETRY_GRACE_SECONDS )); then
+            log 'action=telemetry_missing'; stop_active work; return 78
+        fi
+        sleep "$POLL_SECONDS"
+    done
+    wait "$active_pid"; return $?
+}
+
+publish_phase idle 0 '' || exit 78
+probe_until_safe
+
+resume_session=''
+resume_model=''
+resume_effort=''
 while true; do
-    launch_count=$((launch_count + 1))
-    rm -f "$pause_file"
-
-    if [[ -n "$resume_session_id" ]]; then
-        launch_args=(--resume "$resume_session_id" "$AUTO_RESUME_PROMPT")
-        log "action=resume launch=$launch_count session_id=$resume_session_id"
-        printf 'claude-guard: resuming Claude session %s after confirmed usage reset.\n' "$resume_session_id" >/dev/tty
+    generation=$((generation + 1)); rm -f "$HOOK_MARKER_FILE" "$TELEMETRY_FILE"
+    launch_args=()
+    if [[ -n "$resume_session" ]]; then
+        launch_args=(--resume "$resume_session")
+        [[ -n "$resume_model" ]] && launch_args+=(--model "$resume_model")
+        [[ -n "$resume_effort" ]] && launch_args+=(--effort "$resume_effort")
+        launch_args+=("$RESUME_PROMPT")
+        settings="$RESUME_SETTINGS_JSON"
     else
         launch_args=("$@")
-        log "action=start launch=$launch_count"
+        settings="$RUNTIME_SETTINGS_JSON"
     fi
+    (( OPTIMIZATION_PROFILE == 0 )) && settings="$SAFETY_SETTINGS_JSON"
 
-    effective_args=()
-    if [[ "$OPTIMIZATION_PROFILE" == "1" ]]; then
-        profile_settings="$RUNTIME_SETTINGS_JSON"
-        if [[ -n "$resume_session_id" || "$initial_session_is_resume" == "1" ]]; then
-            profile_settings="$RESUME_SETTINGS_JSON"
-        fi
-        effective_args+=(--settings "$profile_settings" --agents "$EXPLORE_AGENT_JSON")
-    fi
-    effective_args+=("${launch_args[@]}")
+    launch_env env CLAUSE_ACTIVE_KIND=work claude --settings "$settings" --agents "$EXPLORE_AGENT_JSON" \
+        "${launch_args[@]}" </dev/tty >/dev/tty 2>/dev/tty &
+    active_pid=$!; publish_phase active "$active_pid" work || exit 78
+    watch_work; rc=$?
+    active_pid=''; publish_phase idle 0 '' || true
 
-    CLAUDE_GUARD_ACTIVE=1 \
-    CLAUDE_GUARD_INSTANCE_ID="$instance_id" \
-    CLAUDE_GUARD_5H_STOP="$FIVE_HOUR_STOP" \
-    CLAUDE_GUARD_7D_STOP="$SEVEN_DAY_STOP" \
-    claude "${effective_args[@]}" </dev/tty >/dev/tty 2>/dev/tty &
-    claude_pid=$!
-
-    jq -n \
-        --arg instance_id "$instance_id" \
-        --argjson wrapper_pid "$$" \
-        --argjson claude_pid "$claude_pid" \
-        --arg cwd "$PWD" \
-        --argjson launch_count "$launch_count" \
-        --argjson started_at "$(date +%s)" \
-        '{instance_id:$instance_id, wrapper_pid:$wrapper_pid, claude_pid:$claude_pid, cwd:$cwd, launch_count:$launch_count, started_at:$started_at}' \
-        >"$instance_file"
-    chmod 600 "$instance_file"
-
-    watch_usage &
-    watchdog_pid=$!
-
-    wait "$claude_pid"
-    claude_exit=$?
-    claude_pid=''
-
-    kill "$watchdog_pid" 2>/dev/null || true
-    wait "$watchdog_pid" 2>/dev/null || true
-    watchdog_pid=''
-
-    log "action=claude_exit launch=$launch_count exit_code=$claude_exit"
-
-    if [[ ! -s "$pause_file" ]] || ! jq -e . "$pause_file" >/dev/null 2>&1; then
-        exit "$claude_exit"
-    fi
-
-    if [[ "$AUTO_RESUME" != "1" || "$resume_eligible" != "1" || "$user_aborted" == "1" ]]; then
-        printf 'claude-guard: task paused. Automatic resume is disabled or this invocation is not resumable.\n' >/dev/tty
-        exit 75
-    fi
-
-    if ! resume_session_id="$(get_session_id)"; then
-        printf 'claude-guard: task paused, but no persistent session ID was captured; cannot resume automatically.\n' >&2
-        exit 76
-    fi
-
-    log "action=wait_for_reset session_id=$resume_session_id"
-    wait_until_reset_timestamp
-    confirm_reset_with_probe
+    if (( rc != 75 )); then exit "$rc"; fi
+    if [[ "$AUTO_RESUME" != 1 ]]; then exit 75; fi
+    [[ -s "$SESSION_FILE" ]] && jq -e . "$SESSION_FILE" >/dev/null 2>&1 || { printf 'clause-core: threshold stop lacked session identity; not resuming.\n' >&2; exit 76; }
+    resume_session="$(jq -r '.session_id // empty' "$SESSION_FILE")"
+    resume_model="$(jq -r '.model.id // empty' "$SESSION_FILE")"
+    resume_effort="$(jq -r '.effort // empty' "$SESSION_FILE")"
+    [[ -n "$resume_session" && "$resume_session" != unknown ]] || exit 76
+    probe_until_safe
 done
