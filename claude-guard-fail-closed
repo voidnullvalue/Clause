@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# Fail-closed supervisor for claude-guard-core.
+#
+# The core owns pause/wait/probe/resume. This independent process verifies that
+# Claude keeps publishing fresh status-line telemetry and that the core stops it
+# promptly at a configured threshold. Any monitoring fault kills the complete
+# guarded process tree and never auto-resumes it.
+
+set -uo pipefail
+
+STATE_DIR="${CLAUDE_GUARD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-guard}"
+STATE_FILE="$STATE_DIR/usage.json"
+INSTANCES_DIR="$STATE_DIR/instances"
+LOG_FILE="$STATE_DIR/guard.log"
+CORE="${CLAUDE_GUARD_CORE:-$HOME/.local/bin/claude-guard-core}"
+FIVE_HOUR_STOP="${CLAUDE_GUARD_5H_STOP:-95}"
+SEVEN_DAY_STOP="${CLAUDE_GUARD_7D_STOP:-95}"
+POLL_SECONDS="${CLAUDE_GUARD_SUPERVISOR_POLL_SECONDS:-1}"
+STARTUP_GRACE="${CLAUDE_GUARD_TELEMETRY_STARTUP_GRACE_SECONDS:-60}"
+STALE_SECONDS="${CLAUDE_GUARD_TELEMETRY_STALE_SECONDS:-30}"
+USAGE_GRACE="${CLAUDE_GUARD_USAGE_DATA_GRACE_SECONDS:-180}"
+BLOCK_GRACE="${CLAUDE_GUARD_BLOCK_HANDLING_GRACE_SECONDS:-15}"
+TERM_GRACE="${CLAUDE_GUARD_SUPERVISOR_TERM_GRACE_SECONDS:-5}"
+
+for cmd in jq pgrep date awk; do
+    command -v "$cmd" >/dev/null 2>&1 || {
+        printf 'claude-guard: fail-closed dependency missing: %s\n' "$cmd" >&2
+        exit 127
+    }
+done
+
+is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+is_number() { [[ "${1:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]; }
+ge() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'; }
+
+for name in POLL_SECONDS STARTUP_GRACE STALE_SECONDS USAGE_GRACE BLOCK_GRACE TERM_GRACE; do
+    value="${!name}"
+    if ! is_uint "$value" || (( value < 1 )); then
+        printf 'claude-guard: %s must be a positive integer.\n' "$name" >&2
+        exit 64
+    fi
+done
+
+# Consume the escape hatch before requiring the core.
+bypass=0
+forward=()
+for arg in "$@"; do
+    case "$arg" in
+        --guard-bypass) bypass=1 ;;
+        *) forward+=("$arg") ;;
+    esac
+done
+set -- "${forward[@]}"
+
+if [[ "$bypass" == "1" ]]; then
+    command -v claude >/dev/null 2>&1 || exit 127
+    exec claude "$@"
+fi
+
+if [[ ! -x "$CORE" ]]; then
+    printf 'claude-guard: fail-closed core not executable: %s\n' "$CORE" >&2
+    exit 127
+fi
+
+mkdir -p "$INSTANCES_DIR"
+chmod 700 "$STATE_DIR" "$INSTANCES_DIR" 2>/dev/null || true
+
+supervisor_started="$(date +%s)"
+core_pid=''
+instance_file=''
+claude_pid=''
+telemetry_deadline=0
+usage_deadline=0
+telemetry_seen=0
+usage_seen=0
+block_seen_at=0
+
+log() {
+    printf '%s supervisor_pid=%s core_pid=%s %s\n' \
+        "$(date --iso-8601=seconds)" "$$" "${core_pid:-none}" "$*" >>"$LOG_FILE"
+}
+
+children_of() { pgrep -P "$1" 2>/dev/null || true; }
+
+signal_tree() {
+    local sig="$1" pid="$2" child
+    while read -r child; do
+        [[ -n "$child" ]] && signal_tree "$sig" "$child"
+    done < <(children_of "$pid")
+    kill "-$sig" "$pid" 2>/dev/null || true
+}
+
+fail_closed() {
+    local reason="$1"
+    log "action=fail_closed reason=$(printf '%q' "$reason")"
+    printf '\nclaude-guard: FAIL CLOSED: %s\n' "$reason" >/dev/tty 2>/dev/null || \
+        printf '\nclaude-guard: FAIL CLOSED: %s\n' "$reason" >&2
+    if [[ -n "$core_pid" ]] && kill -0 "$core_pid" 2>/dev/null; then
+        signal_tree TERM "$core_pid"
+        sleep "$TERM_GRACE"
+    fi
+    if [[ -n "$core_pid" ]] && kill -0 "$core_pid" 2>/dev/null; then
+        signal_tree KILL "$core_pid"
+    fi
+}
+
+cleanup() {
+    local rc=$?
+    trap - EXIT INT TERM HUP
+    if [[ -n "$core_pid" ]] && kill -0 "$core_pid" 2>/dev/null; then
+        fail_closed 'supervisor exited while guarded work was active'
+    fi
+    exit "$rc"
+}
+
+on_signal() {
+    fail_closed 'supervisor received a termination signal'
+    core_pid=''
+    exit 130
+}
+
+trap cleanup EXIT
+trap on_signal INT TERM HUP
+
+find_instance() {
+    local file wrapper started
+    shopt -s nullglob
+    for file in "$INSTANCES_DIR"/*.json; do
+        case "$file" in *.session.json|*.pause.json) continue ;; esac
+        jq -e . "$file" >/dev/null 2>&1 || continue
+        wrapper="$(jq -r '.wrapper_pid // 0' "$file")"
+        started="$(jq -r '.started_at // 0' "$file")"
+        if [[ "$wrapper" == "$core_pid" ]] && is_uint "$started" \
+            && (( started >= supervisor_started - 2 )); then
+            printf '%s' "$file"
+            shopt -u nullglob
+            return 0
+        fi
+    done
+    shopt -u nullglob
+    return 1
+}
+
+read_active() {
+    local candidate pid started now
+    if [[ -z "$instance_file" || ! -s "$instance_file" ]]; then
+        candidate="$(find_instance 2>/dev/null || true)"
+        [[ -n "$candidate" ]] || return 1
+        instance_file="$candidate"
+    fi
+    jq -e . "$instance_file" >/dev/null 2>&1 || return 2
+    pid="$(jq -r '.claude_pid // 0' "$instance_file")"
+    started="$(jq -r '.started_at // 0' "$instance_file")"
+    is_uint "$pid" && (( pid > 1 )) || return 2
+    is_uint "$started" && (( started > 0 )) || return 2
+    if [[ "$pid" != "$claude_pid" ]]; then
+        now="$(date +%s)"
+        claude_pid="$pid"
+        telemetry_deadline=$((now + STARTUP_GRACE))
+        usage_deadline=$((now + USAGE_GRACE))
+        telemetry_seen=0
+        usage_seen=0
+        block_seen_at=0
+        log "action=monitor claude_pid=$claude_pid instance=$(basename "$instance_file")"
+    fi
+}
+
+telemetry_fresh() {
+    local session_file now session_updated state_updated session_id state_session
+    session_file="${instance_file%.json}.session.json"
+    now="$(date +%s)"
+    [[ -s "$session_file" ]] && jq -e . "$session_file" >/dev/null 2>&1 || return 1
+    session_updated="$(jq -r '.updated_at // 0' "$session_file")"
+    session_id="$(jq -r '.session_id // empty' "$session_file")"
+    is_uint "$session_updated" && (( session_updated > 0 )) || return 1
+    [[ -n "$session_id" && "$session_id" != unknown ]] || return 1
+    (( now - session_updated <= STALE_SECONDS )) || return 1
+    [[ -s "$STATE_FILE" ]] && jq -e . "$STATE_FILE" >/dev/null 2>&1 || return 1
+    state_updated="$(jq -r '.updated_at // 0' "$STATE_FILE")"
+    state_session="$(jq -r '.last_session_id // empty' "$STATE_FILE")"
+    is_uint "$state_updated" && (( state_updated > 0 )) || return 1
+    (( now - state_updated <= STALE_SECONDS )) || return 1
+    if [[ "$state_session" != "$session_id" ]] && (( state_updated < session_updated )); then
+        return 1
+    fi
+}
+
+usage_available() {
+    local five seven
+    [[ -s "$STATE_FILE" ]] && jq -e . "$STATE_FILE" >/dev/null 2>&1 || return 1
+    five="$(jq -r '.five_hour.used_percentage // empty' "$STATE_FILE")"
+    seven="$(jq -r '.seven_day.used_percentage // empty' "$STATE_FILE")"
+    is_number "$five" || is_number "$seven"
+}
+
+account_blocked() {
+    local now five five_reset seven seven_reset
+    [[ -s "$STATE_FILE" ]] && jq -e . "$STATE_FILE" >/dev/null 2>&1 || return 1
+    now="$(date +%s)"
+    five="$(jq -r '.five_hour.used_percentage // empty' "$STATE_FILE")"
+    five_reset="$(jq -r '.five_hour.resets_at // 0' "$STATE_FILE")"
+    seven="$(jq -r '.seven_day.used_percentage // empty' "$STATE_FILE")"
+    seven_reset="$(jq -r '.seven_day.resets_at // 0' "$STATE_FILE")"
+    if is_number "$five" && is_uint "$five_reset" && (( five_reset > now )) \
+        && ge "$five" "$FIVE_HOUR_STOP"; then return 0; fi
+    if is_number "$seven" && is_uint "$seven_reset" && (( seven_reset > now )) \
+        && ge "$seven" "$SEVEN_DAY_STOP"; then return 0; fi
+    return 1
+}
+
+log "action=supervisor_start core=$(printf '%q' "$CORE") argc=$#"
+"$CORE" "$@" </dev/tty >/dev/tty 2>/dev/tty &
+core_pid=$!
+
+while kill -0 "$core_pid" 2>/dev/null; do
+    now="$(date +%s)"
+    read_rc=0
+    read_active || read_rc=$?
+    if (( read_rc == 2 )); then
+        fail_closed 'core published a malformed active-instance record'
+        core_pid=''
+        exit 78
+    fi
+
+    if [[ -n "$claude_pid" ]] && kill -0 "$claude_pid" 2>/dev/null; then
+        if telemetry_fresh; then
+            telemetry_seen=1
+        elif (( telemetry_seen == 1 || now >= telemetry_deadline )); then
+            fail_closed 'status-line usage telemetry is missing or stale'
+            core_pid=''
+            exit 78
+        fi
+
+        if usage_available; then
+            usage_seen=1
+        elif (( now >= usage_deadline )); then
+            fail_closed 'rate-limit percentages never became available'
+            core_pid=''
+            exit 78
+        fi
+
+        if (( usage_seen == 1 )) && account_blocked; then
+            if (( block_seen_at == 0 )); then
+                block_seen_at="$now"
+                log "action=block_observed claude_pid=$claude_pid"
+            elif (( now - block_seen_at >= BLOCK_GRACE )); then
+                fail_closed "threshold crossed but core did not stop Claude within ${BLOCK_GRACE}s"
+                core_pid=''
+                exit 79
+            fi
+        else
+            block_seen_at=0
+        fi
+    else
+        block_seen_at=0
+    fi
+    sleep "$POLL_SECONDS"
+done
+
+wait "$core_pid"
+core_rc=$?
+
+# The core can die before the polling loop discovers its instance file.
+if [[ -z "$claude_pid" ]]; then
+    departed="$(find_instance 2>/dev/null || true)"
+    if [[ -n "$departed" ]] && jq -e . "$departed" >/dev/null 2>&1; then
+        pid="$(jq -r '.claude_pid // 0' "$departed")"
+        is_uint "$pid" && (( pid > 1 )) && claude_pid="$pid"
+    fi
+fi
+
+if [[ -n "$claude_pid" ]] && kill -0 "$claude_pid" 2>/dev/null; then
+    log "action=fail_closed reason=core_exited_with_live_claude claude_pid=$claude_pid core_rc=$core_rc"
+    printf '\nclaude-guard: FAIL CLOSED: core exited while Claude was running.\n' >/dev/tty 2>/dev/null || true
+    signal_tree TERM "$claude_pid"
+    sleep "$TERM_GRACE"
+    kill -0 "$claude_pid" 2>/dev/null && signal_tree KILL "$claude_pid"
+    core_pid=''
+    exit 80
+fi
+
+core_pid=''
+exit "$core_rc"
