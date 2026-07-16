@@ -7,8 +7,9 @@
 #   3. Waits until every blocking rate-limit window has reset.
 #   4. Resumes the exact saved Claude session by session_id and asks it to
 #      verify filesystem state before continuing the interrupted task.
+#   5. Applies a token-efficient runtime profile without changing settings.json.
 #
-# Requires: bash, jq, flock, pgrep, date, claude.
+# Requires: bash, jq, flock, pgrep, date, awk, claude.
 
 set -uo pipefail
 
@@ -25,7 +26,42 @@ TERM_GRACE_SECONDS="${CLAUDE_GUARD_TERM_GRACE_SECONDS:-3}"
 RESET_BUFFER_SECONDS="${CLAUDE_GUARD_RESET_BUFFER_SECONDS:-10}"
 WAIT_NOTICE_SECONDS="${CLAUDE_GUARD_WAIT_NOTICE_SECONDS:-300}"
 AUTO_RESUME="${CLAUDE_GUARD_AUTO_RESUME:-1}"
+OPTIMIZATION_PROFILE="${CLAUDE_GUARD_OPTIMIZATION_PROFILE:-1}"
 AUTO_RESUME_PROMPT="${CLAUDE_GUARD_RESUME_PROMPT:-Usage limits have reset. Continue the original task from the exact current repository and session state. Before changing anything, inspect git status, git diff, any task list, and the results of commands that may have been interrupted. Do not repeat completed external side effects or destructive operations. Verify the result of an interrupted operation before retrying it, then continue until the original task is complete.}"
+
+# Fresh sessions receive the complete default profile. Resumed sessions omit
+# model and effort so a user's in-session /model and /effort choices survive.
+RUNTIME_SETTINGS_JSON='{"model":"sonnet","effortLevel":"medium","autoCompactEnabled":true,"workflowSizeGuideline":"small","verbose":false,"permissions":{"deny":["Agent(general-purpose)"]}}'
+RESUME_SETTINGS_JSON='{"autoCompactEnabled":true,"workflowSizeGuideline":"small","verbose":false,"permissions":{"deny":["Agent(general-purpose)"]}}'
+EXPLORE_AGENT_JSON='{"Explore":{"description":"Targeted read-only repository lookup used only when exact files, symbols, or call paths are unknown.","prompt":"Search narrowly and return concise evidence. Prefer exact symbols, strings, and known directory boundaries. Do not broadly survey the repository. Do not inspect generated, dependency, cache, build, or vendor directories unless directly implicated. Do not paste entire files or large command outputs. Return only relevant file paths and line ranges, the discovered call or data flow, and unresolved ambiguity requiring further inspection.","tools":["Read","Grep","Glob"],"model":"haiku","effort":"low"}}'
+
+# Wrapper-only flags are consumed here and never forwarded to Claude Code.
+# --guard-bypass is intentionally processed before usage state or dependencies,
+# making it a reliable escape hatch when `claude` is aliased to claude-guard.
+guard_bypass=0
+forward_args=()
+for arg in "$@"; do
+    case "$arg" in
+        --guard-bypass)
+            guard_bypass=1
+            ;;
+        --guard-no-profile)
+            OPTIMIZATION_PROFILE=0
+            ;;
+        *)
+            forward_args+=("$arg")
+            ;;
+    esac
+done
+set -- "${forward_args[@]}"
+
+if [[ "$guard_bypass" == "1" ]]; then
+    if ! command -v claude >/dev/null 2>&1; then
+        printf 'claude-guard: claude executable not found.\n' >&2
+        exit 127
+    fi
+    exec claude "$@"
+fi
 
 mkdir -p "$INSTANCES_DIR"
 chmod 700 "$STATE_DIR" "$INSTANCES_DIR" 2>/dev/null || true
@@ -98,10 +134,14 @@ read_block() {
 
 # Auto-resume is intentionally limited to persistent interactive sessions.
 resume_eligible=1
+initial_session_is_resume=0
 for arg in "$@"; do
     case "$arg" in
         -p|--print|--no-session-persistence)
             resume_eligible=0
+            ;;
+        -c|--continue|-r|--resume)
+            initial_session_is_resume=1
             ;;
     esac
 done
@@ -123,6 +163,11 @@ esac
 
 if [[ "$AUTO_RESUME" != "1" && "$AUTO_RESUME" != "0" ]]; then
     printf 'claude-guard: CLAUDE_GUARD_AUTO_RESUME must be 0 or 1.\n' >&2
+    exit 64
+fi
+
+if [[ "$OPTIMIZATION_PROFILE" != "1" && "$OPTIMIZATION_PROFILE" != "0" ]]; then
+    printf 'claude-guard: CLAUDE_GUARD_OPTIMIZATION_PROFILE must be 0 or 1.\n' >&2
     exit 64
 fi
 
@@ -263,7 +308,7 @@ on_signal() {
 trap cleanup EXIT
 trap on_signal INT TERM HUP
 
-log "action=wrapper_start cwd=$(printf '%q' "$PWD") argc=$# auto_resume=$AUTO_RESUME resume_eligible=$resume_eligible"
+log "action=wrapper_start cwd=$(printf '%q' "$PWD") argc=$# auto_resume=$AUTO_RESUME resume_eligible=$resume_eligible optimization_profile=$OPTIMIZATION_PROFILE"
 
 # When started while already blocked, either wait or retain the original hard
 # refusal behavior depending on CLAUDE_GUARD_AUTO_RESUME.
@@ -293,13 +338,23 @@ while true; do
         log "action=start launch=$launch_count"
     fi
 
+    effective_args=()
+    if [[ "$OPTIMIZATION_PROFILE" == "1" ]]; then
+        profile_settings="$RUNTIME_SETTINGS_JSON"
+        if [[ -n "$resume_session_id" || "$initial_session_is_resume" == "1" ]]; then
+            profile_settings="$RESUME_SETTINGS_JSON"
+        fi
+        effective_args+=(--settings "$profile_settings" --agents "$EXPLORE_AGENT_JSON")
+    fi
+    effective_args+=("${launch_args[@]}")
+
     # Explicit /dev/tty redirection keeps the interactive TUI attached while
     # the wrapper runs its watchdog beside it.
     CLAUDE_GUARD_ACTIVE=1 \
     CLAUDE_GUARD_INSTANCE_ID="$instance_id" \
     CLAUDE_GUARD_5H_STOP="$FIVE_HOUR_STOP" \
     CLAUDE_GUARD_7D_STOP="$SEVEN_DAY_STOP" \
-    claude "${launch_args[@]}" </dev/tty >/dev/tty 2>/dev/tty &
+    claude "${effective_args[@]}" </dev/tty >/dev/tty 2>/dev/tty &
     claude_pid=$!
 
     jq -n \
