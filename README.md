@@ -20,9 +20,20 @@ alias claude='claude-guard'
 CLAUDE_GUARD_5H_STOP=90 CLAUDE_GUARD_7D_STOP=90 claude-guard
 ```
 
-At a configured threshold, Clause stops the active Claude Code process, waits for every blocking reset timestamp, and resumes the exact persisted session with a continuation prompt that first verifies repository state.
+At a configured threshold, Clause stops the active Claude Code process and waits until every blocking reset timestamp has passed. It then makes one non-persistent Haiku request to verify that Anthropic is actually accepting requests again. Only after that probe succeeds does it resume the exact persisted session with a continuation prompt that first verifies repository state.
+
+A failed or timed-out reset probe does not resume the saved session. Clause retries with exponential backoff, starting at 30 seconds and capping at five minutes. This prevents a stale local `resets_at` timestamp from causing a rapid resume/fail loop.
 
 Set `CLAUDE_GUARD_AUTO_RESUME=0` to retain hard-stop behavior without automatic waiting or resumption.
+
+Optional reset-probe controls:
+
+```bash
+CLAUDE_GUARD_RESET_PROBE_MODEL=haiku
+CLAUDE_GUARD_RESET_PROBE_INITIAL_SECONDS=30
+CLAUDE_GUARD_RESET_PROBE_MAX_SECONDS=300
+CLAUDE_GUARD_RESET_PROBE_TIMEOUT_SECONDS=90
+```
 
 ## Token-efficient runtime profile
 
