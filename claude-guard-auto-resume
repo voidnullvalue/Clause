@@ -5,16 +5,18 @@
 #   1. Watches Claude Code's structured statusLine rate-limit telemetry.
 #   2. Stops the current Claude process when a configured threshold is reached.
 #   3. Waits until every blocking rate-limit window has reset.
-#   4. Resumes the exact saved Claude session by session_id and asks it to
+#   4. Confirms the reset with one cheap Haiku request before resuming.
+#   5. Resumes the exact saved Claude session by session_id and asks it to
 #      verify filesystem state before continuing the interrupted task.
-#   5. Applies a token-efficient runtime profile without changing settings.json.
+#   6. Applies a token-efficient runtime profile without changing settings.json.
 #
-# Requires: bash, jq, flock, pgrep, date, awk, claude.
+# Requires: bash, jq, flock, pgrep, date, awk, timeout, grep, claude.
 
 set -uo pipefail
 
 STATE_DIR="${CLAUDE_GUARD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-guard}"
 STATE_FILE="$STATE_DIR/usage.json"
+LOCK_FILE="$STATE_DIR/usage.lock"
 INSTANCES_DIR="$STATE_DIR/instances"
 LOG_FILE="$STATE_DIR/guard.log"
 
@@ -25,19 +27,19 @@ INT_GRACE_SECONDS="${CLAUDE_GUARD_INT_GRACE_SECONDS:-3}"
 TERM_GRACE_SECONDS="${CLAUDE_GUARD_TERM_GRACE_SECONDS:-3}"
 RESET_BUFFER_SECONDS="${CLAUDE_GUARD_RESET_BUFFER_SECONDS:-10}"
 WAIT_NOTICE_SECONDS="${CLAUDE_GUARD_WAIT_NOTICE_SECONDS:-300}"
+RESET_PROBE_INITIAL_SECONDS="${CLAUDE_GUARD_RESET_PROBE_INITIAL_SECONDS:-30}"
+RESET_PROBE_MAX_SECONDS="${CLAUDE_GUARD_RESET_PROBE_MAX_SECONDS:-300}"
+RESET_PROBE_TIMEOUT_SECONDS="${CLAUDE_GUARD_RESET_PROBE_TIMEOUT_SECONDS:-90}"
+RESET_PROBE_MODEL="${CLAUDE_GUARD_RESET_PROBE_MODEL:-haiku}"
+RESET_PROBE_TOKEN='CLAUDE_GUARD_RESET_OK'
 AUTO_RESUME="${CLAUDE_GUARD_AUTO_RESUME:-1}"
 OPTIMIZATION_PROFILE="${CLAUDE_GUARD_OPTIMIZATION_PROFILE:-1}"
 AUTO_RESUME_PROMPT="${CLAUDE_GUARD_RESUME_PROMPT:-Usage limits have reset. Continue the original task from the exact current repository and session state. Before changing anything, inspect git status, git diff, any task list, and the results of commands that may have been interrupted. Do not repeat completed external side effects or destructive operations. Verify the result of an interrupted operation before retrying it, then continue until the original task is complete.}"
 
-# Fresh sessions receive the complete default profile. Resumed sessions omit
-# model and effort so a user's in-session /model and /effort choices survive.
 RUNTIME_SETTINGS_JSON='{"model":"sonnet","effortLevel":"medium","autoCompactEnabled":true,"workflowSizeGuideline":"small","verbose":false,"permissions":{"deny":["Agent(general-purpose)"]}}'
 RESUME_SETTINGS_JSON='{"autoCompactEnabled":true,"workflowSizeGuideline":"small","verbose":false,"permissions":{"deny":["Agent(general-purpose)"]}}'
 EXPLORE_AGENT_JSON='{"Explore":{"description":"Targeted read-only repository lookup used only when exact files, symbols, or call paths are unknown.","prompt":"Search narrowly and return concise evidence. Prefer exact symbols, strings, and known directory boundaries. Do not broadly survey the repository. Do not inspect generated, dependency, cache, build, or vendor directories unless directly implicated. Do not paste entire files or large command outputs. Return only relevant file paths and line ranges, the discovered call or data flow, and unresolved ambiguity requiring further inspection.","tools":["Read","Grep","Glob"],"model":"haiku","effort":"low"}}'
 
-# Wrapper-only flags are consumed here and never forwarded to Claude Code.
-# --guard-bypass is intentionally processed before usage state or dependencies,
-# making it a reliable escape hatch when `claude` is aliased to claude-guard.
 guard_bypass=0
 forward_args=()
 for arg in "$@"; do
@@ -66,7 +68,7 @@ fi
 mkdir -p "$INSTANCES_DIR"
 chmod 700 "$STATE_DIR" "$INSTANCES_DIR" 2>/dev/null || true
 
-for cmd in claude jq flock pgrep date awk; do
+for cmd in claude jq flock pgrep date awk timeout grep; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         printf 'claude-guard: required command not found: %s\n' "$cmd" >&2
         exit 127
@@ -94,9 +96,6 @@ log() {
     printf '%s instance=%s %s\n' "$(date --iso-8601=seconds)" "$instance_id" "$*" >>"$LOG_FILE"
 }
 
-# Sets BLOCK_REASON, BLOCK_PCT, and BLOCK_RESET to the combined active block.
-# If both windows block, BLOCK_RESET is the later reset so automatic resumption
-# cannot accidentally run while the other window is still exhausted.
 read_block() {
     local now five_pct five_reset seven_pct seven_reset
     local reasons=() pcts=() latest_reset=0
@@ -132,7 +131,100 @@ read_block() {
     return 0
 }
 
-# Auto-resume is intentionally limited to persistent interactive sessions.
+needs_reset_confirmation() {
+    local now verified five_pct five_reset seven_pct seven_reset
+
+    [[ -s "$STATE_FILE" ]] || return 1
+    jq -e . "$STATE_FILE" >/dev/null 2>&1 || return 1
+
+    now="$(date +%s)"
+    verified="$(jq -r '.reset_confirmation.verified_at // 0' "$STATE_FILE")"
+    five_pct="$(jq -r '.five_hour.used_percentage // empty' "$STATE_FILE")"
+    five_reset="$(jq -r '.five_hour.resets_at // 0' "$STATE_FILE")"
+    seven_pct="$(jq -r '.seven_day.used_percentage // empty' "$STATE_FILE")"
+    seven_reset="$(jq -r '.seven_day.resets_at // 0' "$STATE_FILE")"
+
+    if is_number "$five_pct" && is_uint "$five_reset" \
+        && ge "$five_pct" "$FIVE_HOUR_STOP" \
+        && (( five_reset > 0 && five_reset <= now && verified < five_reset )); then
+        return 0
+    fi
+
+    if is_number "$seven_pct" && is_uint "$seven_reset" \
+        && ge "$seven_pct" "$SEVEN_DAY_STOP" \
+        && (( seven_reset > 0 && seven_reset <= now && verified < seven_reset )); then
+        return 0
+    fi
+
+    return 1
+}
+
+mark_reset_confirmed() {
+    local now tmp
+    now="$(date +%s)"
+
+    exec 7>"$LOCK_FILE"
+    flock -x 7
+    if [[ -s "$STATE_FILE" ]] && jq -e . "$STATE_FILE" >/dev/null 2>&1; then
+        tmp="$(mktemp "$STATE_DIR/.usage.XXXXXX")"
+        jq \
+            --argjson now "$now" \
+            --arg model "$RESET_PROBE_MODEL" \
+            '.reset_confirmation = {verified_at:$now, model:$model}' \
+            "$STATE_FILE" >"$tmp"
+        chmod 600 "$tmp"
+        mv -f "$tmp" "$STATE_FILE"
+    fi
+    flock -u 7
+}
+
+confirm_reset_with_probe() {
+    local delay attempt probe_output probe_exit probe_result
+    delay="$RESET_PROBE_INITIAL_SECONDS"
+    attempt=0
+
+    while true; do
+        attempt=$((attempt + 1))
+        probe_output="$(mktemp "$STATE_DIR/.reset-probe.XXXXXX")"
+        probe_exit=0
+        probe_result='request_failed'
+
+        printf 'claude-guard: confirming reset with a one-turn %s probe (attempt %s).\n' \
+            "$RESET_PROBE_MODEL" "$attempt" >/dev/tty
+        log "action=reset_probe_start attempt=$attempt model=$(printf '%q' "$RESET_PROBE_MODEL")"
+
+        timeout "$RESET_PROBE_TIMEOUT_SECONDS" \
+            claude --print --model "$RESET_PROBE_MODEL" --no-session-persistence \
+            "Reply with exactly $RESET_PROBE_TOKEN and nothing else." \
+            </dev/null >"$probe_output" 2>&1 || probe_exit=$?
+
+        if (( probe_exit == 0 )) && grep -Fq "$RESET_PROBE_TOKEN" "$probe_output"; then
+            rm -f "$probe_output"
+            mark_reset_confirmed
+            log "action=reset_probe_success attempt=$attempt"
+            printf 'claude-guard: reset confirmed; resuming the saved session.\n' >/dev/tty
+            return 0
+        fi
+
+        if (( probe_exit == 124 )); then
+            probe_result='timeout'
+        elif (( probe_exit == 0 )); then
+            probe_result='unexpected_output'
+        fi
+        rm -f "$probe_output"
+
+        log "action=reset_probe_retry attempt=$attempt result=$probe_result exit_code=$probe_exit retry_seconds=$delay"
+        printf 'claude-guard: reset not confirmed (%s, exit %s); retrying in %ss.\n' \
+            "$probe_result" "$probe_exit" "$delay" >/dev/tty
+        sleep "$delay"
+
+        if (( delay < RESET_PROBE_MAX_SECONDS )); then
+            delay=$((delay * 2))
+            (( delay > RESET_PROBE_MAX_SECONDS )) && delay="$RESET_PROBE_MAX_SECONDS"
+        fi
+    done
+}
+
 resume_eligible=1
 initial_session_is_resume=0
 for arg in "$@"; do
@@ -146,8 +238,6 @@ for arg in "$@"; do
     esac
 done
 
-# Do not attempt to "resume" maintenance/subcommand invocations if claude is
-# aliased to this wrapper.
 first_non_option=''
 for arg in "$@"; do
     if [[ "$arg" != -* ]]; then
@@ -168,6 +258,19 @@ fi
 
 if [[ "$OPTIMIZATION_PROFILE" != "1" && "$OPTIMIZATION_PROFILE" != "0" ]]; then
     printf 'claude-guard: CLAUDE_GUARD_OPTIMIZATION_PROFILE must be 0 or 1.\n' >&2
+    exit 64
+fi
+
+for value_name in RESET_PROBE_INITIAL_SECONDS RESET_PROBE_MAX_SECONDS RESET_PROBE_TIMEOUT_SECONDS; do
+    value="${!value_name}"
+    if ! is_uint "$value" || (( value < 1 )); then
+        printf 'claude-guard: %s must be a positive integer.\n' "CLAUDE_GUARD_${value_name}" >&2
+        exit 64
+    fi
+done
+
+if (( RESET_PROBE_INITIAL_SECONDS > RESET_PROBE_MAX_SECONDS )); then
+    printf 'claude-guard: CLAUDE_GUARD_RESET_PROBE_INITIAL_SECONDS must not exceed CLAUDE_GUARD_RESET_PROBE_MAX_SECONDS.\n' >&2
     exit 64
 fi
 
@@ -200,9 +303,6 @@ stop_claude() {
     printf '\nclaude-guard: pausing Claude Code: %s\n' "$why" >/dev/tty
 
     if [[ -n "$claude_pid" ]] && kill -0 "$claude_pid" 2>/dev/null; then
-        # Usually runs immediately after a completed assistant response because
-        # rate-limit state arrives through statusLine. SIGINT still handles the
-        # case where another turn began before the watchdog observed the state.
         kill -INT "$claude_pid" 2>/dev/null || true
         sleep "$INT_GRACE_SECONDS"
     fi
@@ -232,6 +332,7 @@ write_pause_file() {
 }
 
 watch_usage() {
+    trap - EXIT INT TERM HUP
     while kill -0 "$claude_pid" 2>/dev/null; do
         if read_block; then
             write_pause_file "$BLOCK_REASON" "$BLOCK_PCT" "$BLOCK_RESET"
@@ -259,7 +360,7 @@ get_session_id() {
     return 1
 }
 
-wait_until_unblocked() {
+wait_until_reset_timestamp() {
     local last_notice=0 now remaining sleep_for
 
     while read_block; do
@@ -268,7 +369,7 @@ wait_until_unblocked() {
         (( remaining < 1 )) && remaining=1
 
         if (( last_notice == 0 || now - last_notice >= WAIT_NOTICE_SECONDS || remaining <= 60 )); then
-            printf 'claude-guard: waiting for %s reset; resume after %s (%ss remaining).\n' \
+            printf 'claude-guard: waiting for %s reset; probe after %s (%ss remaining).\n' \
                 "$BLOCK_REASON" "$(format_epoch "$((BLOCK_RESET + RESET_BUFFER_SECONDS))")" "$remaining" >/dev/tty
             last_notice="$now"
         fi
@@ -278,7 +379,6 @@ wait_until_unblocked() {
         sleep "$sleep_for"
     done
 
-    # A small buffer avoids resuming against a server clock that trails locally.
     sleep "$RESET_BUFFER_SECONDS"
 }
 
@@ -310,17 +410,19 @@ trap on_signal INT TERM HUP
 
 log "action=wrapper_start cwd=$(printf '%q' "$PWD") argc=$# auto_resume=$AUTO_RESUME resume_eligible=$resume_eligible optimization_profile=$OPTIMIZATION_PROFILE"
 
-# When started while already blocked, either wait or retain the original hard
-# refusal behavior depending on CLAUDE_GUARD_AUTO_RESUME.
 if read_block; then
     if [[ "$AUTO_RESUME" == "1" && "$resume_eligible" == "1" ]]; then
         printf 'claude-guard: usage is already blocked by %s at %s%%.\n' "$BLOCK_REASON" "$BLOCK_PCT" >/dev/tty
-        wait_until_unblocked
+        wait_until_reset_timestamp
+        confirm_reset_with_probe
     else
         printf 'claude-guard: refusing to start: %s usage is %s%%.\n' "$BLOCK_REASON" "$BLOCK_PCT" >&2
         printf 'claude-guard: allowed again after %s.\n' "$(format_epoch "$BLOCK_RESET")" >&2
         exit 75
     fi
+elif needs_reset_confirmation; then
+    printf 'claude-guard: cached usage is still above threshold after its reset timestamp; verifying availability before launch.\n' >/dev/tty
+    confirm_reset_with_probe
 fi
 
 resume_session_id=''
@@ -332,7 +434,7 @@ while true; do
     if [[ -n "$resume_session_id" ]]; then
         launch_args=(--resume "$resume_session_id" "$AUTO_RESUME_PROMPT")
         log "action=resume launch=$launch_count session_id=$resume_session_id"
-        printf 'claude-guard: resuming Claude session %s after usage reset.\n' "$resume_session_id" >/dev/tty
+        printf 'claude-guard: resuming Claude session %s after confirmed usage reset.\n' "$resume_session_id" >/dev/tty
     else
         launch_args=("$@")
         log "action=start launch=$launch_count"
@@ -348,8 +450,6 @@ while true; do
     fi
     effective_args+=("${launch_args[@]}")
 
-    # Explicit /dev/tty redirection keeps the interactive TUI attached while
-    # the wrapper runs its watchdog beside it.
     CLAUDE_GUARD_ACTIVE=1 \
     CLAUDE_GUARD_INSTANCE_ID="$instance_id" \
     CLAUDE_GUARD_5H_STOP="$FIVE_HOUR_STOP" \
@@ -381,8 +481,6 @@ while true; do
 
     log "action=claude_exit launch=$launch_count exit_code=$claude_exit"
 
-    # Normal exit, /exit, authentication failure, or a user Ctrl+C directed at
-    # Claude itself: do not invent a resume unless the watchdog recorded a block.
     if [[ ! -s "$pause_file" ]] || ! jq -e . "$pause_file" >/dev/null 2>&1; then
         exit "$claude_exit"
     fi
@@ -398,6 +496,6 @@ while true; do
     fi
 
     log "action=wait_for_reset session_id=$resume_session_id"
-    wait_until_unblocked
-    # Loop relaunches the exact session and supplies AUTO_RESUME_PROMPT.
+    wait_until_reset_timestamp
+    confirm_reset_with_probe
 done
