@@ -13,7 +13,7 @@ CLAUSE_STATE_DIR="$STATE_HOME/clause"
 OLD_STATE_DIR="$STATE_HOME/claude-guard"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 
-for cmd in jq install mktemp rm mkdir flock pgrep date awk od tr grep; do
+for cmd in jq install mktemp rm mkdir flock pgrep date awk od tr grep sed; do
     command -v "$cmd" >/dev/null 2>&1 || {
         printf 'Missing required command: %s\n' "$cmd" >&2
         exit 127
@@ -30,7 +30,21 @@ done
 mkdir -p "$BIN_DIR" "$LIBEXEC_DIR" "$CLAUDE_DIR" "$CLAUSE_STATE_DIR"
 chmod 700 "$LIBEXEC_DIR" "$CLAUSE_STATE_DIR" 2>/dev/null || true
 install -m 0755 "$SOURCE_DIR/claude-guard-fail-closed" "$BIN_DIR/clause"
-install -m 0700 "$SOURCE_DIR/claude-guard-auto-resume" "$LIBEXEC_DIR/clause-core"
+
+# Claude Code permits --no-session-persistence only with --print. Clause's
+# preflight is intentionally interactive because it relies on status-line
+# telemetry, so remove the incompatible flag from the installed core.
+core_tmp="$(mktemp "$LIBEXEC_DIR/.clause-core.XXXXXX")"
+sed 's/ --no-session-persistence \\/ \\/' \
+    "$SOURCE_DIR/claude-guard-auto-resume" >"$core_tmp"
+if grep -q -- '--no-session-persistence' "$core_tmp"; then
+    printf 'Failed to remove invalid preflight flag from Clause core.\n' >&2
+    rm -f "$core_tmp"
+    exit 1
+fi
+chmod 700 "$core_tmp"
+mv -f "$core_tmp" "$LIBEXEC_DIR/clause-core"
+
 install -m 0700 "$SOURCE_DIR/claude-guard-statusline-auto-resume.sh" "$LIBEXEC_DIR/clause-statusline.sh"
 install -m 0700 "$SOURCE_DIR/clause-tool-gate.sh" "$LIBEXEC_DIR/clause-tool-gate.sh"
 
